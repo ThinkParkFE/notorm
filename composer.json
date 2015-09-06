@@ -4,12 +4,16 @@
 	"keywords": ["database", "dbal"],
 	"homepage": "http://www.notorm.com/",
 	"license": ["Apache-2.0", "GPL-2.0+"],
+	"version" : "1.0.0",
 	"authors": [
 		{
 			"name": "Jakub Vrána",
 			"homepage": "http://www.vrana.cz/"
 		}
 	],
+	"require" : {
+	  "php" : ">=5.1.0"
+	},
 	"autoload": {
 		"files": ["NotORM.php"]
 	}
