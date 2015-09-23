@@ -10,6 +10,8 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 	protected $union = array(), $unionOrder = array(), $unionLimit = null, $unionOffset = null;
 	protected $data, $referencing = array(), $aggregation = array(), $accessed, $access, $keys = array();
 	
+    public static $queryTimes = 0;
+
 	/** Create table result
 	* @param string
 	* @param NotORM
@@ -42,7 +44,8 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 		if (isset($limit) && $this->notORM->driver != "oci" && $this->notORM->driver != "dblib" && $this->notORM->driver != "mssql" && $this->notORM->driver != "sqlsrv") {
 			$return .= " LIMIT $limit";
 			if ($offset) {
-				$return .= " OFFSET $offset";
+                //$return .= " OFFSET $offset";
+                $return .= ",$offset";      //@dogstar 2014-10-24
 			}
 		}
 		return $return;
@@ -140,7 +143,23 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 	}
 	
 	protected function query($query, $parameters) {
+        $debugTrace = array();
+
+        self::$queryTimes ++;
+
+        /**
+         * 修正当参数过多时的SQLSTATE[HY093] @dogstar 2014-11-18
+         */
+        $parameters = array_map(array($this, 'formatValue'), $parameters);
+        foreach ($parameters as $key => $val) {
+            if (substr($key, 0, 1) == ':' && stripos($query, $key) === false) {
+                unset($parameters[$key]);
+            }
+        }
+
 		if ($this->notORM->debug) {
+            $debugTrace['startTime'] = microtime(true);
+
 			if (!is_callable($this->notORM->debug)) {
 				$debug = "$query;";
 				if ($parameters) {
@@ -153,14 +172,34 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 					}
 				}
 				error_log("$backtrace[file]:$backtrace[line]:$debug\n", 0);
+                //if ($this->notORM->debug) echo "$debug<br />\n";    //@dogstar 2014-10-31
+
+                $debugTrace['sql'] = $debug;
 			} elseif (call_user_func($this->notORM->debug, $query, $parameters) === false) {
 				return false;
 			}
 		}
-		$return = $this->notORM->connection->prepare($query);
-		if (!$return || !$return->execute(array_map(array($this, 'formatValue'), $parameters))) {
+        $return = $this->notORM->connection->prepare($query);
+		$errorMessage = null;
+
+		if (!$return || !$return->execute($parameters)) {
+			$errorInfo = $return->errorInfo();
+            $errorMessage = isset($errorInfo[2]) ? $errorInfo[2] : $errorMessage;
+
 			$return = false;
-		}
+        }
+
+        if ($this->notORM->debug) {
+            $debugTrace['endTime'] = microtime(true);
+
+            echo sprintf("[%s - %ss]%s<br>\n", self::$queryTimes, round($debugTrace['endTime'] - $debugTrace['startTime'], 5), $debugTrace['sql']);
+        }
+
+        //显式抛出异常，以让开发同学尽早发现SQL语法问题 @dogstar 20150426
+        if ($return === false && $errorMessage !== null) {
+            throw new PDOException($errorMessage);
+        }
+
 		if ($this->notORM->debugTimer) {
 			call_user_func($this->notORM->debugTimer);
 		}
@@ -234,6 +273,7 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 			);
 		}
 		// requires empty $this->parameters
+        //print_r("INSERT INTO $this->table $insert");
 		$return = $this->query("INSERT INTO $this->table $insert", $parameters);
 		if (!$return) {
 			return false;
@@ -357,7 +397,15 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 		if ($this->notORM->freeze) {
 			return false;
 		}
-		$return = $this->query("DELETE" . $this->topString($this->limit, $this->offset) . " FROM $this->table" . $this->whereString(), $this->parameters);
+        //防止误删，禁止全表的删除
+        //@dogstar - 2014-10-24
+        $where = $this->whereString();
+        if (empty($where)) {
+            throw new Exception('sorry, you can not delete the whole table --dogstar');
+            return false;
+        }
+
+		$return = $this->query("DELETE" . $this->topString($this->limit, $this->offset) . " FROM $this->table" . $where, $this->parameters);
 		if (!$return) {
 			return false;
 		}
@@ -496,19 +544,18 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 	}
 	
 	/** Add order clause, more calls appends to the end
-	* @param mixed "column1, column2 DESC" or array("column1", "column2 DESC"), empty string to reset previous order
+	* @param string for example "column1, column2 DESC", empty string to reset previous order
 	* @param string ...
 	* @return NotORM_Result fluent interface
 	*/
 	function order($columns) {
 		$this->rows = null;
 		if ($columns != "") {
-			$columns = (is_array($columns) ? $columns : func_get_args());
-			foreach ($columns as $column) {
+			foreach (func_get_args() as $columns) {
 				if ($this->union) {
-					$this->unionOrder[] = $column;
+					$this->unionOrder[] = $columns;
 				} else {
-					$this->order[] = $column;
+					$this->order[] = $columns;
 				}
 			}
 		} elseif ($this->union) {
@@ -519,7 +566,15 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 		return $this;
 	}
 	
-	/** Set limit clause, more calls rewrite old values
+	/** 
+	* 对查询进行limit操作
+	* 
+	* 请注意以下两种用法，与NotORM原来的定义有所区别
+	* 
+	* - limit(数量)
+	* - limit(开始位置，数量)
+	* 
+	* Set limit clause, more calls rewrite old values
 	* @param int
 	* @param int
 	* @return NotORM_Result fluent interface
@@ -647,36 +702,105 @@ class NotORM_Result extends NotORM_Abstract implements Iterator, ArrayAccess, Co
 				}
 			}
 			$this->rows = array();
-			if ($result) {
-				$result->setFetchMode(PDO::FETCH_ASSOC);
-				foreach ($result as $key => $row) {
-					if (isset($row[$this->primary])) {
-						$key = $row[$this->primary];
-						if (!is_string($this->access)) {
-							$this->access[$this->primary] = true;
-						}
-					}
-					$this->rows[$key] = new $this->notORM->rowClass($row, $this);
-				}
-			}
-			$this->data = $this->rows;
-		}
-	}
-	
-	/** Fetch next row of result
-	* @param string column name to return or an empty string for the whole row
-	* @return mixed string or null with $column, NotORM_Row without $column, false if there is no row
-	*/
-	function fetch($column = '') {
-		// no $this->select($column) because next calls can access different columns
-		$this->execute();
-		$return = current($this->data);
-		next($this->data);
-		if ($return && $column != '') {
-			return $return[$column];
-		}
-		return $return;
-	}
+            if ($result) {
+                $result->setFetchMode(PDO::FETCH_ASSOC);
+                foreach ($result as $key => $row) {
+                    if (isset($row[$this->primary])) {
+                        $key = $row[$this->primary];
+                        if (!is_string($this->access)) {
+                            $this->access[$this->primary] = true;
+                        }
+                    }
+                    //$this->rows[$key] = new $this->notORM->rowClass($row, $this);
+                    //@dogstar 改用返回数组 2014-11-01
+                    $this->rows[] = $row;
+                }
+            }
+            $this->data = $this->rows;
+        }
+    }
+
+    /** Fetch next row of result
+     * @param string column name to return or an empty string for the whole row
+     * @return mixed string or null with $column, NotORM_Row without $column, false if there is no row
+     */
+    function fetch($column = '') {
+        // no $this->select($column) because next calls can access different columns
+        $this->execute();
+        $return = current($this->data);
+        next($this->data);
+        if ($return && $column != '') {
+            return $return[$column];
+        }
+        return $return;
+    }
+
+    /**
+     * fetchRow别名，等效于NotORM_Result::fetchRow()
+     * @author: dogstar 2015-04-26
+     */
+    function fetchOne($column = '') {
+        return $this->fetchRow($column);
+    }
+
+    /**
+     * 只查询第一行纪录，等效于NotORM_Result::fetchOne()
+     * @author: dogstar 2015-04-18
+     */
+    function fetchRow($column = '') {
+        $this->limit(1)->execute();
+        return $this->fetch($column);
+    }
+
+    /**
+     * 返回全部的数据，等效于NotORM_Result::fetchRows()
+     * @author: dogstar 2014-11-01
+     */
+    function fetchAll() {
+        $this->execute();
+        return $this->data;
+    }
+
+    /**
+     * fetchAll别名，等效于NotORM_Result::fetchAll()
+     * @author: dogstar 2015-04-26
+     */
+    function fetchRows() {
+        return $this->fetchAll();
+    }
+
+    /**
+     * queryRows别名，等效于NotORM_Result::queryRows($sql, $parmas)
+     * @author: dogstar 2015-04-26
+     */
+    function queryAll($sql, $parmas) {
+        return $this->queryRows($sql, $parmas);
+    }
+
+    /**
+     * 根据SQL查询全部数据，等效于NotORM_Result::queryAll($sql, $parmas)
+     * @return array
+     * @author: dogstar 2014-11-01
+     */
+    function queryRows($sql, $parmas) {
+        $result = $this->query($sql, $parmas);
+
+        $rows = array();
+        if ($result) {
+            $result->setFetchMode(PDO::FETCH_ASSOC);
+            foreach ($result as $key => $row) {
+                if (isset($row[$this->primary])) {
+                    $key = $row[$this->primary];
+                    if (!is_string($this->access)) {
+                        $this->access[$this->primary] = true;
+                    }
+                }
+                $rows[] = $row;
+            }
+        }
+
+        return $rows;
+    }
 	
 	/** Fetch all rows as associative array
 	* @param string

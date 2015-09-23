@@ -189,5 +189,11 @@ class NotORM_Row extends NotORM_Abstract implements IteratorAggregate, ArrayAcce
 	function jsonSerialize() {
 		return $this->row;
 	}
+
+    // @dogstar 2014-10-24
+    function toArray()
+    {
+        return $this->row();
+    }
 	
 }
